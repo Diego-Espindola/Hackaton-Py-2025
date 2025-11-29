@@ -8,7 +8,6 @@ import json
 URI_ROBO = "ws://192.168.1.116:81"
 
 # IP do SERVIDOR DO JOGO (Envia status de power up/game over)
-# Se estiver rodando no mesmo PC, use localhost. Se for outro PC, coloque o IP dele.
 URI_GAME_SERVER = "ws://127.0.0.1:8765" 
 
 # --- CONFIGURACOES DE CONTROLE ---
@@ -83,7 +82,7 @@ def calcular_motores(velocidade_limite):
     return m1, m2
 
 # ====================================================================
-# TAREFA 1: OUVIR SERVIDOR DO JOGO (Game Server)
+# OUVIR SERVIDOR DO JOGO (Game Server)
 # ====================================================================
 async def conectar_game_server():
     print(f"[GAME] Tentando conectar ao servidor do jogo: {URI_GAME_SERVER}")
@@ -96,11 +95,7 @@ async def conectar_game_server():
                 async for message in ws:
                     try:
                         data = json.loads(message)
-                        
-                        # Tenta ler do campo 'estado_jogo', senao tenta ler da raiz
                         status = data.get("estado_jogo", data)
-
-                        # --- DETECTAR POWER UP ---
                         power_now = status.get("power_active", False)
                         
                         if power_now and not estado.power_active:
@@ -130,7 +125,7 @@ async def conectar_game_server():
             await asyncio.sleep(1)
 
 # ====================================================================
-# TAREFA 2: CONTROLAR ROBO (Firmware)
+# CONTROLAR ROBO (Firmware)
 # ====================================================================
 async def conectar_robo():
     print(f"[ROBO] Tentando conectar ao firmware: {URI_ROBO}")
@@ -170,12 +165,11 @@ async def conectar_robo():
                     await asyncio.sleep(TAXA_ENVIO)
 
         except (ConnectionRefusedError, OSError):
-            print("[ROBO] Falha ao conectar no Robo. Tentando novamente em 1s...", end="\r")
-            await asyncio.sleep(1)
+            print("[ROBO] Falha ao conectar no Robo. Tentando novamente em 0.3s...", end="\r")
+            await asyncio.sleep(0.3)
         except Exception as e:
             print(f"[ROBO] Erro critico: {e}")
-            await asyncio.sleep(1)
-
+            await asyncio.sleep(0.3)
 # ====================================================================
 # LOOP PRINCIPAL
 # ====================================================================
