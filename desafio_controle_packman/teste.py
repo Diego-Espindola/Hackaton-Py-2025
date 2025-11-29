@@ -3,159 +3,193 @@ import websockets
 import pygame
 import json
 
-# --- CONFIGURAÇÕES ---
-URI = "ws://192.168.1.116:81"
-DEADZONE = 0.15      # Aumentei um pouco para evitar "drift" se o controle for velho
-TAXA_ENVIO = 0.05    # 20hz
-STANDARD_SPEED = 150
-MAX_BOOST = 255
-TURN_CURVE_PERCENTAGE = 0.75  # Percentual máximo de curva para o giro
+# --- CONFIGURACOES DE REDE ---
+# IP do ROBO (Recebe comandos de motor)
+URI_ROBO = "ws://192.168.1.116:81"
 
-# [NOVO] Fator de Suavidade (Inércia)
-# 0.1 = Muito pesado/lento (robô desliza)
-# 0.5 = Médio
-# 1.0 = Instantâneo (como estava antes)
-SUAVIDADE = 0.8
+# IP do SERVIDOR DO JOGO (Envia status de power up/game over)
+# Se estiver rodando no mesmo PC, use localhost. Se for outro PC, coloque o IP dele.
+URI_GAME_SERVER = "ws://127.0.0.1:8765" 
 
-# --- CONFIGURAÇÃO PYGAME ---
+# --- CONFIGURACOES DE CONTROLE ---
+TAXA_ENVIO = 0.05    # 20 mensagens por segundo (20Hz)
+DEADZONE = 0.15      # Zona morta do analogico
+SUAVIDADE = 0.3      # Inercia (0.1 = pesado ... 1.0 = instantaneo)
+
+# --- VELOCIDADES ---
+SPEED_NORMAL = 150
+SPEED_BOOST = 255    # Velocidade quando Power Up esta ativo
+
+# --- ESTADO GLOBAL COMPARTILHADO ---
+class EstadoGlobal:
+    def __init__(self):
+        self.max_speed = SPEED_NORMAL  # Comeca em 150
+        self.power_active = False      # Controle de estado
+        self.game_over = False         # Se True, para o robo
+        self.rodando = True            # Controle geral do script
+
+estado = EstadoGlobal()
+
+# --- INICIALIZACAO JOYSTICK ---
 pygame.init()
 pygame.joystick.init()
 
 if pygame.joystick.get_count() == 0:
-    print("Nenhum controle detectado! Conecte o controle e reinicie.")
+    print("[ERRO] Nenhum controle detectado. Conecte e reinicie.")
     exit()
 
 joystick = pygame.joystick.Joystick(0)
 joystick.init()
-print(f"Controle detectado: {joystick.get_name()}")
+print(f"[SISTEMA] Controle conectado: {joystick.get_name()}")
 
-# --- FUNÇÕES AUXILIARES ---
-
-def limitar_pwm(valor, maximo):
-    return max(min(valor, maximo), -maximo)
-
-def aplicar_curva(valor):
-    """
-    Transforma a entrada linear em exponencial.
-    Isso faz com que movimentos pequenos no analógico sejam MUITO suaves,
-    mas ainda permite velocidade total se empurrar até o fim.
-    Matemática: valor * |valor| (preserva o sinal)
-    """
-    return valor * abs(valor)
+# --- FUNCOES MATEMATICAS ---
 
 def interpolar(atual, alvo, fator):
-    """
-    Técnica de 'Linear Interpolation' (Lerp) para criar inércia.
-    O valor atual tenta alcançar o alvo aos poucos.
-    """
     return atual + (alvo - atual) * fator
 
-def calcular_alvo_motores():
+def calcular_motores(velocidade_limite):
     pygame.event.pump()
-
-    # Leitura Bruta
-    raw_throttle = -joystick.get_axis(1)  # Analógico Y (cima/baixo)
-    raw_turn = joystick.get_axis(0)       # Analógico X (esquerda/direita)
-
-    # 1. Aplica Deadzone
-    if abs(raw_throttle) < DEADZONE: raw_throttle = 0
-    if abs(raw_turn) < DEADZONE: raw_turn = 0
-
-    # 2. Aplica Curva Exponencial    
-    turn = aplicar_curva(raw_turn) * TURN_CURVE_PERCENTAGE
-
-
-    # Botões: A acelera, B ré/freia
-    acelerar = joystick.get_button(0)
-    re = joystick.get_button(1)
-
-    # Boost
-    modo_boost = False # IMPLEMENTAR NO FUTURO
-    velocidade_max = MAX_BOOST if modo_boost else STANDARD_SPEED
-
-    # Se apertar A ou B, ignora analógico Y e envia aceleração máxima
-    if acelerar:
-        throttle = 1.0  # Máxima para frente
-    elif re:
-        throttle = -1.0 # Máxima para trás
-    else:
-        throttle = 0.0
-
-    if throttle != 0:
-        # Acelerando: giro só reduz velocidade de uma roda (invertido)
-        motor_esq_target = throttle * velocidade_max * (1.0 + min(0, turn))
-        motor_dir_target = throttle * velocidade_max * (1.0 - max(0, turn))
-    else:
-        # Só girando: rodas opostas (invertido)
-        motor_esq_target = -turn * velocidade_max
-        motor_dir_target = turn * velocidade_max
-
-    # Limita ao máximo permitido antes de retornar
-    motor_esq_target = limitar_pwm(motor_esq_target, velocidade_max)
-    motor_dir_target = limitar_pwm(motor_dir_target, velocidade_max)
     
+    # 1. Leitura dos Botoes (A e B)
+    # Acelera para frente (A) ou tras (B)
+    btn_a = joystick.get_button(0)
+    btn_b = joystick.get_button(1)
 
-    return motor_esq_target, motor_dir_target
+    throttle = 0.0
+    if btn_a: throttle = 1.0
+    elif btn_b: throttle = -1.0
 
-# --- LOOP ASSÍNCRONO PRINCIPAL ---
+    # 2. Leitura do Analogico (Curva)
+    turn = joystick.get_axis(0)
+    if abs(turn) < DEADZONE: turn = 0.0
+    
+    # Aplica curva exponencial para suavizar a direcao
+    turn = turn * abs(turn)
 
-async def rodar_controle():
-    print(f"Conectando a {URI}...")
+    # 3. Mistura (Arcade Drive)
+    left = throttle + turn
+    right = throttle - turn
 
-    # Variáveis de estado para a suavização (Inércia)
-    m1_atual = 0.0
-    m2_atual = 0.0
+    # 4. Normalizacao (Se a soma passar de 1.0, reduz proporcionalmente)
+    maior = max(abs(left), abs(right))
+    if maior > 1.0:
+        left /= maior
+        right /= maior
 
-    while True:
+    # 5. Calculo final PWM
+    m1 = int(left * velocidade_limite)
+    m2 = int(right * velocidade_limite)
+
+    return m1, m2
+
+# ====================================================================
+# TAREFA 1: OUVIR SERVIDOR DO JOGO (Game Server)
+# ====================================================================
+async def conectar_game_server():
+    print(f"[GAME] Tentando conectar ao servidor do jogo: {URI_GAME_SERVER}")
+    
+    while estado.rodando:
         try:
-            async with websockets.connect(URI) as websocket:
-                print("Conectado! Controle Suavizado Ativo.")
+            async with websockets.connect(URI_GAME_SERVER) as ws:
+                print("[GAME] Conectado ao Servidor do Jogo.")
+                
+                async for message in ws:
+                    try:
+                        data = json.loads(message)
+                        
+                        # Tenta ler do campo 'estado_jogo', senao tenta ler da raiz
+                        status = data.get("estado_jogo", data)
 
-                # Variáveis para evitar envio repetido
-                ultimo_m1 = None
-                ultimo_m2 = None
+                        # --- DETECTAR POWER UP ---
+                        power_now = status.get("power_active", False)
+                        
+                        if power_now and not estado.power_active:
+                            print(f"[GAME] POWER UP ATIVADO! Velocidade ajustada para {SPEED_BOOST}")
+                            estado.power_active = True
+                            estado.max_speed = SPEED_BOOST
+                        
+                        elif not power_now and estado.power_active:
+                            print(f"[GAME] Power Up finalizado. Velocidade retornou a {SPEED_NORMAL}")
+                            estado.power_active = False
+                            estado.max_speed = SPEED_NORMAL
 
-                while True:
-                    # 1. Calcula onde queremos chegar (Target)
-                    alvo_m1, alvo_m2 = calcular_alvo_motores()
+                        # --- DETECTAR GAME OVER ---
+                        if status.get("game_over", False):
+                            if not estado.game_over:
+                                print("[GAME] GAME OVER RECEBIDO. Parando motores.")
+                                estado.game_over = True
+                    
+                    except json.JSONDecodeError:
+                        pass
+        
+        except (ConnectionRefusedError, OSError):
+            print("[GAME] Falha ao conectar no jogo. Tentando novamente em 3s...", end="\r")
+            await asyncio.sleep(3)
+        except Exception as e:
+            print(f"[GAME] Erro: {e}")
+            await asyncio.sleep(1)
 
-                    # 2. [NOVO] Calcula o passo intermediário (Suavização)
-                    m1_atual = interpolar(m1_atual, alvo_m1, SUAVIDADE)
-                    m2_atual = interpolar(m2_atual, alvo_m2, SUAVIDADE)
+# ====================================================================
+# TAREFA 2: CONTROLAR ROBO (Firmware)
+# ====================================================================
+async def conectar_robo():
+    print(f"[ROBO] Tentando conectar ao firmware: {URI_ROBO}")
+    m1_atual, m2_atual = 0.0, 0.0
 
-                    # Arredonda para inteiro para enviar no JSON
-                    m1_int = int(m1_atual)
-                    m2_int = int(m2_atual)
+    while estado.rodando:
+        try:
+            async with websockets.connect(URI_ROBO) as ws:
+                print("[ROBO] Conectado ao Robo. Controle ativo.")
+                
+                while estado.rodando:
+                    # Se estiver em Game Over, força parada
+                    if estado.game_over:
+                        cmd = {"motor1_vel": 0, "motor2_vel": 0}
+                        await ws.send(json.dumps(cmd))
+                        await asyncio.sleep(0.5)
+                        continue
 
-                    # Só envia se mudou ou se não for ambos zero
-                    if (m1_int != ultimo_m1 or m2_int != ultimo_m2) or (m1_int != 0 or m2_int != 0):
-                        print(
-                            f"Enviando: Motor1={m1_int}, Motor2={m2_int}"
-                        )
-                        comando = {
-                            "motor1_vel": m1_int,
-                            "motor2_vel": m2_int
-                        }
-                        mensagem_json = json.dumps(comando)
-                        await websocket.send(mensagem_json)
-                        ultimo_m1 = m1_int
-                        ultimo_m2 = m2_int
+                    # 1. Calcula motores com a velocidade definida pelo Game Server
+                    target_m1, target_m2 = calcular_motores(estado.max_speed)
+
+                    # 2. Suavizacao (Ramping)
+                    m1_atual = interpolar(m1_atual, target_m1, SUAVIDADE)
+                    m2_atual = interpolar(m2_atual, target_m2, SUAVIDADE)
+
+                    # 3. Envia comando
+                    cmd = {
+                        "motor1_vel": int(m1_atual),
+                        "motor2_vel": int(m2_atual)
+                    }
+                    await ws.send(json.dumps(cmd))
+
+                    # Log no terminal (sobrescreve a linha para nao poluir)
+                    status_txt = "BOOST" if estado.power_active else "NORMAL"
+                    print(f"[STATUS: {status_txt}] M1: {int(m1_atual):4} | M2: {int(m2_atual):4}", end="\r")
 
                     await asyncio.sleep(TAXA_ENVIO)
 
-        except websockets.exceptions.ConnectionClosed:
-            print("Conexão fechada. Tentando reconectar...")
-            await asyncio.sleep(0.5)  # Espera curta antes de tentar reconectar
-        except KeyboardInterrupt:
-            print("\nParando...")
-            break
+        except (ConnectionRefusedError, OSError):
+            print("[ROBO] Falha ao conectar no Robo. Tentando novamente em 1s...", end="\r")
+            await asyncio.sleep(1)
         except Exception as e:
-            print(f"Erro inesperado: {e}. Tentando reconectar...")
-            await asyncio.sleep(0.5)
-    pygame.quit()
+            print(f"[ROBO] Erro critico: {e}")
+            await asyncio.sleep(1)
+
+# ====================================================================
+# LOOP PRINCIPAL
+# ====================================================================
+async def main():
+    # Roda as duas tarefas simultaneamente
+    # Se uma cair, a outra continua rodando
+    await asyncio.gather(
+        conectar_game_server(),
+        conectar_robo()
+    )
 
 if __name__ == "__main__":
     try:
-        asyncio.run(rodar_controle())
+        asyncio.run(main())
     except KeyboardInterrupt:
-        pass
+        print("\n[SISTEMA] Encerrando script.")
+        pygame.quit()
