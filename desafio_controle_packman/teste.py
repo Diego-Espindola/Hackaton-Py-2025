@@ -9,12 +9,13 @@ DEADZONE = 0.15      # Aumentei um pouco para evitar "drift" se o controle for v
 TAXA_ENVIO = 0.05    # 20hz
 STANDARD_SPEED = 150
 MAX_BOOST = 255
+TURN_CURVE_PERCENTAGE = 0.75  # Percentual máximo de curva para o giro
 
 # [NOVO] Fator de Suavidade (Inércia)
 # 0.1 = Muito pesado/lento (robô desliza)
 # 0.5 = Médio
 # 1.0 = Instantâneo (como estava antes)
-SUAVIDADE = 0.2 
+SUAVIDADE = 0.8
 
 # --- CONFIGURAÇÃO PYGAME ---
 pygame.init()
@@ -60,16 +61,14 @@ def calcular_alvo_motores():
     if abs(raw_throttle) < DEADZONE: raw_throttle = 0
     if abs(raw_turn) < DEADZONE: raw_turn = 0
 
-    # 2. Aplica Curva Exponencial
-    turn = aplicar_curva(raw_turn) * 0.7
+    # 2. Aplica Curva Exponencial    
+    turn = aplicar_curva(raw_turn) * TURN_CURVE_PERCENTAGE
 
 
     # Botões: A acelera, B ré/freia
-    acelerar = joystick.get_button(5)  # RT
-    re = joystick.get_button(2)        # LT
+    acelerar = joystick.get_button(0)
+    re = joystick.get_button(1)
 
-    dpad = joystick.get_hat(0)  # Retorna (x, y)
-    print(f"D-Pad: {dpad}")
     # Boost
     modo_boost = False # IMPLEMENTAR NO FUTURO
     velocidade_max = MAX_BOOST if modo_boost else STANDARD_SPEED
@@ -94,6 +93,7 @@ def calcular_alvo_motores():
     # Limita ao máximo permitido antes de retornar
     motor_esq_target = limitar_pwm(motor_esq_target, velocidade_max)
     motor_dir_target = limitar_pwm(motor_dir_target, velocidade_max)
+    
 
     return motor_esq_target, motor_dir_target
 
@@ -129,6 +129,9 @@ async def rodar_controle():
 
                     # Só envia se mudou ou se não for ambos zero
                     if (m1_int != ultimo_m1 or m2_int != ultimo_m2) or (m1_int != 0 or m2_int != 0):
+                        print(
+                            f"Enviando: Motor1={m1_int}, Motor2={m2_int}"
+                        )
                         comando = {
                             "motor1_vel": m1_int,
                             "motor2_vel": m2_int
